@@ -1,0 +1,973 @@
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/gpu.cpp src/pmemd/src/cuda/gpu.cpp
+--- ../../vanilla/amber16/src/pmemd/src/cuda/gpu.cpp	2019-09-04 11:59:32.012270000 -0400
++++ src/pmemd/src/cuda/gpu.cpp	2019-09-04 13:19:08.804584000 -0400
+@@ -628,11 +628,15 @@
+     if (gpu->sm_version < SM_2X)
+     {
+         gpu->sim.stride                 = ((*atoms + 31) >> 5) << 5;
++        gpu->sim.CVstride                 = ((8 + 31) >> 5) << 5;       // PWD Set Manually CV Atoms
+     }
+     else
+     {
+         gpu->sim.stride                 = ((*atoms + 63) >> 6) << 6;
++        gpu->sim.CVstride                 = ((8 + 63) >> 6) << 6;       // PWD Set Manually CV Atoms
+     }
++    gpu->sim.CVstride2                    = 2 * gpu->sim.CVstride;
++    gpu->sim.CVstride3                    = 3 * gpu->sim.CVstride;
+     gpu->sim.stride2                    = 2 * gpu->sim.stride;
+     gpu->sim.stride3                    = 3 * gpu->sim.stride;
+     gpu->sim.stride4                    = 4 * gpu->sim.stride;
+@@ -661,6 +665,7 @@
+     }
+ 
+     // Clear any previous stuff
++    delete gpu->pbCVCrd;        // PWD
+     delete gpu->pbAtom;
+     delete gpu->pbAtomXYSP;
+     delete gpu->pbAtomZSP;
+@@ -682,6 +687,7 @@
+     delete gpu->pbCenter;
+     delete gpu->pbRandom;
+     delete gpu->pbTIRegion;
++    gpu->pbCVCrd                        = new GpuBuffer<double>(gpu->sim.CVstride3 * 2);    // PWD
+     gpu->pbAtom                         = new GpuBuffer<double>(gpu->sim.stride3 * 2);
+     gpu->pbAtomXYSP                     = new GpuBuffer<PMEFloat2>(gpu->sim.stride);
+     gpu->pbAtomZSP                      = new GpuBuffer<PMEFloat>(gpu->sim.stride);
+@@ -728,6 +734,7 @@
+     gpu->sim.maxNonbondBuffers          = nonbondForceBuffers * gpu->sim.stride3;    
+  
+     // delete any existing accumulators
++    delete gpu->pbCVFrc;        // PWD
+     delete gpu->pbForceAccumulator;
+     delete gpu->pbReffAccumulator;
+ #ifdef MPI
+@@ -756,6 +763,8 @@
+     }    
+     // Allocate new force accumulators
+     gpu->pbForceAccumulator             = new GpuBuffer<PMEAccumulator>(gpu->sim.stride3 * maxForceBuffers * bufferMultiplier);
++    gpu->pbCVFrc                        = new GpuBuffer<PMEAccumulator>(gpu->sim.CVstride3);    //PWD
++    gpu->sim.pCVFrc                     = gpu->pbCVFrc->_pDevData;                              // PWD
+     gpu->sim.pForceAccumulator          = gpu->pbForceAccumulator->_pDevData;
+     gpu->sim.pForceXAccumulator         = gpu->pbForceAccumulator->_pDevData;
+     gpu->sim.pForceYAccumulator         = gpu->sim.pForceAccumulator + gpu->sim.stride;
+@@ -802,6 +811,7 @@
+     }
+ #endif
+ 
++    gpu->sim.pCVCrd                     = gpu->pbCVCrd->_pDevData;      // PWD
+     gpu->sim.pAtomX                     = gpu->pbAtom->_pDevData;
+     gpu->sim.pAtomY                     = gpu->pbAtom->_pDevData + gpu->sim.stride;
+     gpu->sim.pAtomXYSP                  = gpu->pbAtomXYSP->_pDevData;
+@@ -1283,6 +1293,37 @@
+     } 
+ }
+ 
++
++// PWD
++extern "C" void gpu_download_cv_crd_(double atm_crd[][3])
++{
++PRINTMETHOD("gpu_download_cv_crd");
++    int np = 8;
++    kCollectCvCrd(gpu);
++    gpu->pbCVCrd->Download();
++    for (int i = 0; i < np; i++)
++        {
++            atm_crd[i][0]                               = gpu->pbCVCrd->_pSysData[i];
++            atm_crd[i][1]                               = gpu->pbCVCrd->_pSysData[i + gpu->sim.CVstride];
++            atm_crd[i][2]                               = gpu->pbCVCrd->_pSysData[i + gpu->sim.CVstride2];
++        }
++}
++
++extern "C" void gpu_upload_cv_frc_(double atm_frc[][3])
++{
++PRINTMETHOD("gpu_upload_cv_frc");
++    int np = 8;
++    for (int i = 0; i < np; i++)
++        {
++            gpu->pbCVFrc->_pSysData[i]                      = (PMEAccumulator)(FORCESCALE * atm_frc[i][0]);
++            gpu->pbCVFrc->_pSysData[i + gpu->sim.CVstride]  = (PMEAccumulator)(FORCESCALE * atm_frc[i][1]);
++            gpu->pbCVFrc->_pSysData[i + gpu->sim.CVstride2] = (PMEAccumulator)(FORCESCALE * atm_frc[i][2]);
++        }
++    gpu->pbCVFrc->Upload();
++    kAddCvFrc(gpu);
++}
++
++
+ extern "C" void gpu_upload_frc_(double atm_frc[][3])
+ {
+ PRINTMETHOD("gpu_upload_frc");
+@@ -8447,11 +8488,15 @@
+     if (gpu->sm_version < SM_2X)
+     {
+         gpu->sim.stride                 = ((*natoms + 31) >> 5) << 5;
++        gpu->sim.CVstride               = ((8 + 31) >> 5) << 5;       // PWD Set Manually CV Atoms
+     }
+     else
+     {
+         gpu->sim.stride                 = ((*natoms + 63) >> 6) << 6;
++        gpu->sim.CVstride               = ((8 + 63) >> 6) << 6;       // PWD Set Manually CV Atoms
+     }
++    gpu->sim.CVstride2                    = 2 * gpu->sim.CVstride;  // PWD
++    gpu->sim.CVstride3                    = 3 * gpu->sim.CVstride;
+     gpu->sim.stride2                    = 2 * gpu->sim.stride;
+     gpu->sim.stride3                    = 3 * gpu->sim.stride;
+     gpu->sim.stride4                    = 4 * gpu->sim.stride;
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/gpu.h src/pmemd/src/cuda/gpu.h
+--- ../../vanilla/amber16/src/pmemd/src/cuda/gpu.h	2019-09-04 11:59:29.987273000 -0400
++++ src/pmemd/src/cuda/gpu.h	2019-09-04 13:12:17.898485000 -0400
+@@ -16,6 +16,8 @@
+ #define __GPU_H__
+ #include "gputypes.h"
+ // F95 interface
++extern "C" void gpu_download_cv_crd_(double atm_crd[][3]); // PWD
++extern "C" void gpu_upload_cv_frc_(double atm_frc[][3]); // PWD
+ extern "C" void gpu_init_(void);
+ extern "C" void gpu_shutdown_(void);
+ extern "C" void gpu_setup_system_(int* atoms, int* imin, double* tol, int* ntf, int* ntb, int* ips, int* ntp, int* barostat, int* ntt, int* gbsa, int* vrand, int* icnstph, int* ti_mode);
+@@ -202,6 +204,8 @@
+ extern "C" void kCalculateGAMDWeights(gpuContext gpu);
+ extern "C" void kCalculateGAMDWeightAndScaleForces(gpuContext gpu, PMEDouble pot_ene_tot, PMEDouble dih_ene_tot, PMEDouble fwgt);
+ extern "C" void kCalculateGAMDDihedralEnergy(gpuContext gpu);
++extern "C" void kCollectCvCrd(gpuContext gpu);  // PWD
++extern "C" void kAddCvFrc(gpuContext gpu);      // PWD
+ extern "C" void kScaledMDScaleForces(gpuContext gpu, PMEDouble pot_ene_tot, PMEDouble lambda);
+ #ifdef MPI
+ extern "C" void kCopyToAccumulator(gpuContext gpu, PMEAccumulator* p1, PMEAccumulator* p2, int size);
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/gputypes.cpp src/pmemd/src/cuda/gputypes.cpp
+--- ../../vanilla/amber16/src/pmemd/src/cuda/gputypes.cpp	2019-09-04 11:59:29.987870000 -0400
++++ src/pmemd/src/cuda/gputypes.cpp	2019-09-04 13:14:53.257304000 -0400
+@@ -69,6 +69,7 @@
+     sim.fac2                    = 0.0;
+     sim.is_orthog               = true;
+     sim.paddedNumberOfAtoms     = 0;
++    sim.pCVCrd                  = NULL;     // PWD
+     sim.pAtomX                  = NULL;
+     sim.pAtomY                  = NULL;
+     sim.pAtomXYSP               = NULL;
+@@ -306,6 +307,7 @@
+     sim.pForceXAccumulator      = NULL;
+     sim.pForceYAccumulator      = NULL;
+     sim.pForceZAccumulator      = NULL;
++    sim.pCVFrc                  = NULL; //PWD
+     sim.pNBForceAccumulator     = NULL;
+     sim.pNBForceXAccumulator    = NULL;
+     sim.pNBForceYAccumulator    = NULL;
+@@ -636,6 +638,8 @@
+ step(0),
+ forwardPlan(0),
+ backwardPlan(0),
++pbCVCrd(NULL),  //PWD
++pbCVFrc(NULL),  //PWD
+ pbAtom(NULL),
+ pbAtomXYSP(NULL),
+ pbAtomZSP(NULL),
+@@ -932,6 +936,8 @@
+ _gpuContext::~_gpuContext()
+ {
+     // Delete Atom data
++    delete pbCVCrd;         //PWD
++    delete pbCVFrc;         //PWD
+     delete pbAtom;
+     delete pbAtomXYSP;
+     delete pbAtomZSP;    
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/gputypes.h src/pmemd/src/cuda/gputypes.h
+--- ../../vanilla/amber16/src/pmemd/src/cuda/gputypes.h	2019-09-04 11:59:29.988632000 -0400
++++ src/pmemd/src/cuda/gputypes.h	2019-09-04 13:20:56.792286000 -0400
+@@ -903,6 +903,7 @@
+ #endif
+         
+     // Atom stuff
++    double*                     pCVCrd;                             // PWD
+     double*                     pAtomX;                             // Atom X coordinates
+     double*                     pAtomY;                             // Atom Y coordinates
+     double*                     pAtomZ;                             // Atom Z coordinates
+@@ -1409,6 +1410,10 @@
+     PMEAccumulator*             pBondedForceXAccumulator;           // Bare fixed point bonded x force accumulator   
+     PMEAccumulator*             pBondedForceYAccumulator;           // Bare fixed point bonded y force accumulator   
+     PMEAccumulator*             pBondedForceZAccumulator;           // Bare fixed point bonded z force accumulator
++    PMEAccumulator*             pCVFrc;                             // PWD CV Forces
++    int                         CVstride;                           // CVAtom quantity stride
++    int                         CVstride2;                          // CVAtom quantity 2x stride
++    int                         CVstride3;                          // CVAtom quantity 3x stride
+     int                         stride;                             // Atom quantity stride
+     int                         stride2;                            // Atom quantity 2x stride
+     int                         stride3;                            // Atom quantity 3x stride
+@@ -1460,6 +1465,7 @@
+     bool                        bCPURandoms;                // Generate random numbers on CPU instead of GPU
+ 
+     // Atom stuff
++    GpuBuffer<double>*          pbCVCrd;                    // PWD CRD Atoms
+     GpuBuffer<double>*          pbAtom;                     // Atom coordinates
+     GpuBuffer<PMEFloat2>*       pbAtomXYSP;                 // Single Precision Atom X and Y coordinates    
+     GpuBuffer<PMEFloat>*        pbAtomZSP;                  // Single Precision Atom Z coordinate
+@@ -1730,6 +1736,7 @@
+     GpuBuffer<PMEAccumulator>*  pbReffAccumulator;          // Effective Born Radius accumulator
+     GpuBuffer<PMEAccumulator>*  pbSumdeijdaAccumulator;     // Sumdeijda accumulator
+     GpuBuffer<PMEAccumulator>*  pbForceAccumulator;         // Force accumulators
++    GpuBuffer<PMEAccumulator>*  pbCVFrc;                    // Force accumulators PWD
+     GpuBuffer<unsigned long long int>*   pbEnergyBuffer;    // Energy accumulation buffer
+     GpuBuffer<KineticEnergy>*   pbKineticEnergyBuffer;      // Kinetic energy accumulation buffer
+     
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/kForcesUpdate.cu src/pmemd/src/cuda/kForcesUpdate.cu
+--- ../../vanilla/amber16/src/pmemd/src/cuda/kForcesUpdate.cu	2019-09-04 11:59:29.992475000 -0400
++++ src/pmemd/src/cuda/kForcesUpdate.cu	2019-09-04 13:13:40.621237000 -0400
+@@ -1110,10 +1110,60 @@
+     LAUNCHERROR("kLocalToGlobal");
+ }
+ 
++//PWD
++__global__ void
++#if (__CUDA_ARCH__ >= 300)
++__launch_bounds__(SM_3X_GENERAL_THREADS_PER_BLOCK, 1)
++#else
++__launch_bounds__(SM_2X_GENERAL_THREADS_PER_BLOCK, 1)
++#endif
++kCollectCvCrd_kernel()
++{
++    __threadfence();
++    __syncthreads();
++    unsigned int myatoms [] = {4,6,8,14,6,8,14,16};         // PWD CV Atoms indexing begins at 0
++    for (int i = 0; i < 8; i++)
++    {
++        int p1 = cSim.pImageAtomLookup[myatoms[i]];
++        cSim.pCVCrd[i] = cSim.pImageX[p1];
++        cSim.pCVCrd[i + cSim.CVstride] = cSim.pImageY[p1];
++        cSim.pCVCrd[i + cSim.CVstride2] = cSim.pImageZ[p1];
++    }
++}
++
++void kCollectCvCrd(gpuContext gpu)
++{
++    kCollectCvCrd_kernel<<<gpu->blocks, gpu->generalThreadsPerBlock>>>();
++    LAUNCHERROR("kCollectCvCrd");
++}
+ 
+ __global__ void
+ #if (__CUDA_ARCH__ >= 300)
+ __launch_bounds__(SM_3X_GENERAL_THREADS_PER_BLOCK, 1)
++#else
++__launch_bounds__(SM_2X_GENERAL_THREADS_PER_BLOCK, 1)
++#endif
++kAddCvFrc_kernel()
++{
++    __threadfence();
++    unsigned int myatoms [] = {4,6,8,14,6,8,14,16};         // PWD CV Atoms indexing begins at 0
++    for (int i = 0; i < 8; i++)
++    {
++        int p1 = cSim.pImageAtomLookup[myatoms[i]];
++        cSim.pForceAccumulator[p1]                                      += cSim.pCVFrc[i];
++        cSim.pForceAccumulator[p1 + cSim.stride]                        += cSim.pCVFrc[i + cSim.CVstride];
++        cSim.pForceAccumulator[p1 + cSim.stride2]                       += cSim.pCVFrc[i + cSim.CVstride2];
++    }
++}
++
++void kAddCvFrc(gpuContext gpu)
++{
++    kAddCvFrc_kernel<<<1, 1>>>();
++    LAUNCHERROR("kCollectCvCrd");
++}
++__global__ void
++#if (__CUDA_ARCH__ >= 300)
++__launch_bounds__(SM_3X_GENERAL_THREADS_PER_BLOCK, 1)
+ #else
+ __launch_bounds__(SM_2X_GENERAL_THREADS_PER_BLOCK, 1)
+ #endif
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/f90depends src/pmemd/src/f90depends
+--- ../../vanilla/amber16/src/pmemd/src/f90depends	2019-09-04 11:59:31.665532000 -0400
++++ src/pmemd/src/f90depends	2019-09-04 13:22:37.285479000 -0400
+@@ -701,6 +701,7 @@
+ pme_fft_dat$(OSFX): parallel_dat$(OSFX)
+ pme_fft_dat$(OSFX): pmemd_lib$(OSFX)
+ pme_fft_dat$(OSFX): copyright.i
++pme_force$(OSFX): hello$(OSFX)
+ pme_force$(OSFX): gbl_datatypes$(OSFX)
+ pme_force$(OSFX): prmtop_dat$(OSFX)
+ pme_force$(OSFX): energy_records$(OSFX)
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/hello.F90 src/pmemd/src/hello.F90
+--- ../../vanilla/amber16/src/pmemd/src/hello.F90	1969-12-31 19:00:00.000000000 -0500
++++ src/pmemd/src/hello.F90	2019-09-05 20:11:54.503348000 -0400
+@@ -0,0 +1,541 @@
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++! This routine is hard coded for alanine dipeptide, given in as transparent
++! a representation as possible. This is written for readability, and to 
++! demonstrate simple differences between WTmetaD and mABP. This is not 
++! written for speed or elegance. -BMD 2015 --updated to include hyperdynamics
++!
++! Alanine di-peptide ported to AMBER16 - PWD
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++MODULE hello_mod
++!implicit none
++
++contains
++
++subroutine hellof(istep,xx,ff)
++
++      implicit integer*4 (i-n)
++      implicit double precision (a-h,o-z)      
++!declare some stuff 
++      double precision dpop(2,300,300),pop(300,300)
++      double precision dela(3,300,300),ddela(300,300)
++      double precision rfree(300,300),decon(300,300),ocog(3)
++      double precision alp,alp2,bee,cee,omega,DelT,pi,pi2
++      double precision scal,bolt,alpe,bah,bah2,are
++      double precision temp
++      double precision rcom1,rcom2,rcom3
++      integer nbin,imabp,ialp,np
++      save !and save the stuff
++      double precision ff(8*3),xx(8*3)
++      double precision jaco(2,8*3),cog(3), com1, com2, com3
++      double precision deid(3,4),qa(12)
++      double precision ave1(2),freest,s,sf
++      double precision orml,sumd,at1,at2,bang,arg
++
++      if(istep.eq.0)then
++         np=8
++         bah=1d0
++         bah2 = 1d0
++         bah3=0d0
++         nbin = 300 !number of bins in phi-psi
++         open(11,file='./reffreeE') !reference free energy
++         do k=1,nbin
++            do l=1,nbin
++               read(11,*) unk, unk, rfree(l,k) !read it in
++            enddo
++            read(11,*)
++         enddo
++         close(11) !close it
++
++         open(11,file='params.in') !user inputs
++         read(11,*) temp
++         read(11,*) bee !b parameter in mABP
++         read(11,*) cee !c parameter in mABP (is taken as c*dt)
++         read(11,*) alp !alpha
++         read(11,*) imabp !0=mABP, 1=WTmetaD, 2=muTmetaD, 3=SHUS
++         read(11,*) scal !SHUS power== gamma/(1-gamma) or m for muTmetaD
++         read(11,*) are !the r parameter for muT
++         close(11) !close it
++
++         bolt = 8.31441d-3 * temp / 4.184d0
++
++         pi=acos(-1d0) !have some pi
++         pi2=pi*2d0    !twice
++         alpe=alpe*pi/180d0
++         ialp=int(alp)
++
++         dx = (pi2-0d0)/dble(nbin) !grid width
++         tol = alp*dx
++         tol2=4d0*dx
++
++         do j=1,nbin !pre-compute delta_alpha "hill functions"
++            xatj = (j-1)*dx
++            sum=0d0
++            sum2=0d0
++            do i=1,nbin
++               xati = (i-1)*dx
++               arg2=xati-xatj
++               if(arg2.gt.pi)then
++                  arg2=arg2-pi*2d0
++               endif
++               if(arg2.lt.-pi)then
++                  arg2 = arg2 +pi*2d0
++               endif         
++!-----MOLLIIIIIII
++               ex = arg2/tol
++               aex=ex*ex
++               aex=sqrt(aex)
++               aex2=aex*aex
++               func=0d0
++               dermoli=0d0
++               if(aex.lt.1d0)then
++                  func = exp(-scal/(1d0-aex2))/exp(-scal) !so height is 1 at x=0
++                  aa=scal*func/((1d0-aex2)*(1d0-aex2))!should be negative?
++                  dermoli=aa*2d0*ex/tol !right?
++               endif
++               ex = arg2/(tol/2d0)
++               aex=ex*ex
++               aex=sqrt(aex)
++               aex2=aex*aex
++               funca=0d0
++               dermolia=0d0
++               if(aex.lt.1d0)then
++                  funca = exp(-scal/(1d0-aex2))/exp(-scal) !so height is 1 at x=0
++                  aa=scal*funca/((1d0-aex2)*(1d0-aex2))!should be negative?
++                  dermolia=aa*2d0*ex
++               endif
++               ex = arg2/(tol/3d0)
++               aex=ex*ex
++               aex=sqrt(aex)
++               aex2=aex*aex
++               funcb=0d0
++               dermolib=0d0
++               if(aex.lt.1d0)then
++                  funcb = exp(-scal/(1d0-aex2))/exp(-scal) !so height is 1 at x=0
++                  aa=scal*funcb/((1d0-aex2)*(1d0-aex2))!should be negative?
++                  dermolib=aa*2d0*ex
++               endif
++               dela(1,i,j)=func!(func+funca+funcb)/3d0
++               ddela(i,j) = dermoli!(dermoli +dermolia+dermolib)/3d0 !this is for gradient
++
++               sum=sum+dx*dela(1,i,j)
++               sum2=sum2+dx*exp(-arg2*arg2/(10d0*pi/180d0)**2)
++               if(j.eq.150)then
++                  write(90,*) i, dela(1,i,j), &
++                      exp(-arg2*arg2/(10d0*pi/180d0)**2), sum, sum2
++               endif
++!--------------------------------------------------------------------
++!              this is used for the "vanishingly small" alpha,
++!              and uses a width of 2 degrees
++               ex2 = arg2/tol2
++               aex2=ex2*ex2
++               aex2=sqrt(aex2)
++               aex22=aex2*aex2
++               func2=0d0
++               if(aex2.lt.1d0)then
++                  func2 = exp(-scal/(1d0-aex22))/exp(-scal) !so height is 1 at x=0
++               endif
++               dela(2,i,j)=func2!exp(-arg2*arg2/0.0523d0**2)  !for mabp stuff and muTmetaD
++!--------------------------------------------------------------------
++            enddo
++
++         enddo
++         close(90)
++         omega = bolt*bee*cee !WTmetaD conversion, and muTmetaD
++         DelT = bolt*bee/(1d0-bee) !ditto
++
++         do j=1,nbin
++            do i=1,nbin                  
++               pop(i,j) = 0d0   !initialize arrays
++               if(imabp.eq.0)then
++               decon(i,j)=0d0
++               else
++               decon(i,j)=0d0
++               endif
++               dpop(1,i,j) = 0d0
++               dpop(2,i,j) = 0d0
++            enddo
++         enddo
++      endif                     !end the initial stuff
++
++      jaco = 0d0 !this will hold the phi-psi derivatives
++      natom1=1!5 
++      natom2=2!7
++      natom3=3!9
++      natom4=4!15
++      qa(1) = xx(3*natom1-(3-1))
++      qa(2) = xx(3*natom1-(3-2))
++      qa(3) = xx(3*natom1-(3-3))
++      qa(4) = xx(3*natom2-(3-1))
++      qa(5) = xx(3*natom2-(3-2))
++      qa(6) = xx(3*natom2-(3-3))
++      qa(7) = xx(3*natom3-(3-1))
++      qa(8) = xx(3*natom3-(3-2))
++      qa(9) = xx(3*natom3-(3-3))
++      qa(10) = xx(3*natom4-(3-1))
++      qa(11) = xx(3*natom4-(3-2))
++      qa(12) = xx(3*natom4-(3-3))
++      do i=1,3
++         do j=1,4
++            deid(i,j) = 0d0
++         enddo
++      enddo
++      angle = 0d0
++      call bmdDI(qa,deid,angle)
++      angl1 = angle*pi/180d0
++      do idm=1,3
++         ip = natom1*3-(3-idm)
++         jaco(1,ip)=jaco(1,ip)+deid(idm,1)
++      enddo
++      do idm=1,3
++         ip = natom2*3-(3-idm)
++         jaco(1,ip)=jaco(1,ip)+deid(idm,2)
++      enddo
++      do idm=1,3
++         ip = natom3*3-(3-idm)
++         jaco(1,ip)=jaco(1,ip)+deid(idm,3)
++      enddo
++      do idm=1,3
++         ip = natom4*3-(3-idm)
++         jaco(1,ip)=jaco(1,ip)+deid(idm,4)
++      enddo
++      
++      !second angle
++      natom1=5!7
++      natom2=6!9
++      natom3=7!15
++      natom4=8!17
++      qa(1) = xx(3*natom1-(3-1))
++      qa(2) = xx(3*natom1-(3-2))
++      qa(3) = xx(3*natom1-(3-3))
++      qa(4) = xx(3*natom2-(3-1))
++      qa(5) = xx(3*natom2-(3-2))
++      qa(6) = xx(3*natom2-(3-3))
++      qa(7) = xx(3*natom3-(3-1))
++      qa(8) = xx(3*natom3-(3-2))
++      qa(9) = xx(3*natom3-(3-3))
++      qa(10) = xx(3*natom4-(3-1))
++      qa(11) = xx(3*natom4-(3-2))
++      qa(12) = xx(3*natom4-(3-3))
++      do i=1,3
++         do j=1,4
++            deid(i,j) = 0d0
++         enddo
++      enddo
++      angle = 0d0
++      call bmdDI(qa,deid,angle)
++      angl2 = angle*pi/180d0
++
++      do idm=1,3
++         ip = natom1*3-(3-idm)
++         jaco(2,ip)=jaco(2,ip)+deid(idm,1)
++      enddo
++      do idm=1,3
++         ip = natom2*3-(3-idm)
++         jaco(2,ip)=jaco(2,ip)+deid(idm,2)
++      enddo
++      do idm=1,3
++         ip = natom3*3-(3-idm)
++         jaco(2,ip)=jaco(2,ip)+deid(idm,3)
++      enddo
++      do idm=1,3
++         ip = natom4*3-(3-idm)
++         jaco(2,ip)=jaco(2,ip)+deid(idm,4)
++      enddo
++
++      !find the current position in bins
++      dx = (pi2-0d0)/dble(nbin)
++      ibin = int(angl1/dx)+1      
++      if(ibin.gt.nbin)ibin=nbin
++      if(ibin.lt.1)ibin=1     
++      ibin1=ibin
++      ibin = int(angl2/dx)+1      
++      if(ibin.gt.nbin)ibin=nbin
++      if(ibin.lt.1)ibin=1     
++      ibin2=ibin
++
++!-------------------------------------------------------------------------
++!      UPDATE THE BIAS POTENTIAL HERE ---
++!-------------------------------------------------------------------------
++
++      if(imabp.eq.0)then !if mABP, then do this to get forces
++      denom = 1d0+cee*(1d0-bee)*pop(ibin1,ibin2)            
++      ave1(1) = -cee*bee*bolt*dpop(1,ibin1,ibin2)/denom 
++      denom = 1d0+cee*(1d0-bee)*pop(ibin1,ibin2)      
++      ave1(2) = -cee*bee*bolt*dpop(2,ibin1,ibin2)/denom 
++      decon(ibin1,ibin2)=decon(ibin1,ibin2)+1d0
++      elseif(imabp.eq.1)then !do WTmetaD
++      ave1(1) = -dpop(1,ibin1,ibin2)
++      ave1(2) = -dpop(2,ibin1,ibin2)            
++      s=exp(-pop(ibin1,ibin2)/DelT)*omega
++      elseif(imabp.eq.2)then !do muTmetaD
++      ave1(1) = -dpop(1,ibin1,ibin2)
++      ave1(2) = -dpop(2,ibin1,ibin2)            
++
++         fac=(are*bah2+1d0)**scal
++         s=omega*fac/(are*decon(ibin1,ibin2)+1d0)         
++      else !shus-ish
++      ave1(1) = -dpop(1,ibin1,ibin2)
++      ave1(2) = -dpop(2,ibin1,ibin2)      
++      s=omega/(log(pop(ibin1,ibin2)+1d0)**scal+1d0)
++      endif
++      !update grids
++      bah = 1d80
++      bah2=1d0
++      bah3=0d0
++      snorm = 0d0
++      jst=ibin2-(ialp+4) !11 because used 10 in def of tol
++      jnd=ibin2+(ialp+4)
++      do j =jst,jnd!1,nbin!jst,jnd!1,nbin!jst,jnd
++         jb=j
++         if(j.lt.1)jb=j+nbin
++         if(j.gt.nbin)jb=j-nbin         
++
++         atj = (j-1)*dx
++         jbin2=jb !why do this?
++         arg2=angl2-atj
++         if(arg2.gt.pi)then
++            arg2=arg2-pi2
++         endif
++         if(arg2.lt.-pi)then
++            arg2 = arg2 +pi2
++         endif         
++         boomc= dela(2,ibin2,jb) !this is hill with "vanishingly small" width
++         booma=dela(1,ibin2,jb)  !this is hill for biasing
++         ist=ibin1-(ialp+4)           !11 because used 10 in def of tol
++         ind=ibin1+(ialp+4)
++         do i=ist,ind
++            ib=i
++            if(i.lt.1)ib=i+nbin
++            if(i.gt.nbin)ib=i-nbin         
++            ati = (i-1)*dx
++            jbin = ib
++            arg1=angl1-ati
++            if(arg1.gt.pi)then
++               arg1=arg1-pi2
++            endif
++            if(arg1.lt.-pi)then
++               arg1 = arg1 +pi2
++            endif         
++            boomcc= dela(2,ibin1,ib)!second part of "vanishingly small" width
++            boom = dela(1,ibin1,ib)*booma ! product of two hills for bias
++            if(imabp.eq.0)then !mabp
++            pop(jbin,jbin2) = pop(jbin,jbin2) + boom
++!deconvoluted free energy estimate ------------------------------
++!            decon(jbin,jbin2)=decon(jbin,jbin2)+boomcc*boomc
++!----------------------------------------------------------------
++            dpop(1,jbin,jbin2) = dpop(1,jbin,jbin2)+ddela(ibin1,ib) &
++              *dela(1,ibin2,jb)
++            dpop(2,jbin,jbin2) = dpop(2,jbin,jbin2)+ddela(ibin2,jb) &
++               *dela(1,ibin1,ib)
++            else !metaD, or SHUS, depending only on how "s" is defined
++!---------- Notice the array updates are different only by a factor of "s"
++            decon(jbin,jbin2)=decon(jbin,jbin2)+boomcc*boomc!for the PMF
++            pop(jbin,jbin2) = pop(jbin,jbin2) + boom*s
++            if(decon(jbin,jbin2).lt.bah)bah=decon(jbin,jbin2)
++            if(decon(jbin,jbin2).gt.bah2)bah2=decon(jbin,jbin2)
++            if(pop(jbin,jbin2).gt.bah3)bah3=pop(jbin,jbin2)
++            dpop(1,jbin,jbin2) = dpop(1,jbin,jbin2)+ddela(ibin1,ib) &
++               *dela(1,ibin2,jb)*s 
++            dpop(2,jbin,jbin2) = dpop(2,jbin,jbin2)+ddela(ibin2,jb) &
++               *dela(1,ibin1,ib)*s 
++
++            endif
++         enddo
++      enddo
++!----------------------------------------------------------------------
++!Add the bias forces back to system force
++
++      do i=1,8*3!22*3 
++         ff(i) = ff(i)+(ave1(1))*jaco(1,i)+(ave1(2))*jaco(2,i)
++      enddo
++
++!----------------------------------------------------------------------
++!     Write a restart file and get convergence curve
++      if(mod(istep,5000).eq.0)then
++!        TimeStep, Angle1, Angle2, Convergence metric, hill height (not mabp)
++         write(88,*) istep, angl1, angl2, sumd/orml,  s
++         call flush(88) !write to fort.88
++         write(81,*) np
++         write(81,*)
++         do i=1,np
++            write(81,*) 'C ', xx(i*3-(3-1)), xx(i*3-(3-2)), &
++                xx(i*3-(3-3))
++         enddo
++         call flush(81)
++      endif
++      if(mod(istep,50000).eq.0)then 
++         !Get the zero-of energy
++         bang=0d0    
++         do j=1,nbin
++            do i=1,nbin
++               if(imabp.eq.0)then !mABP
++               !mABP sans-MOLLY
++               !freest=-bolt*log(decon(i,j)*pop(i,j)**(bee/(1d0-bee)))
++                  freest=-bolt*log(decon(i,j))
++
++
++               elseif(imabp.eq.1)then !WTmetaD
++                  sf=exp(-pop(i,j)/DelT)*omega
++                  freest = bolt*log(sf)-pop(i,j)
++               elseif(imabp.eq.2)then
++        
++         fac=(are*bah2+1d0)**scal
++         sf=omega*fac/(are*decon(i,j)+1d0)         
++                  freest = bolt*log(sf)-pop(i,j)
++               else
++                  freest=bolt*log(1d0/(log(pop(i,j)+1d0)**scal+1d0)) &
++                      -pop(i,j)                  
++               endif
++               if(freest.lt.bang)bang=freest !Sets the zero
++            enddo
++         enddo
++         er = 0d0
++         open(89,file='freeE')
++         sumd=0d0
++         orml=0d0
++         do j=1,nbin
++            at2 = dx * (dble(j) - 0.5d0)
++            do i=1,nbin           
++               at1 = dx * (dble(i) - 0.5d0)
++               if(imabp.eq.0)then !mABP
++               !mABP sans-MOLLY
++                !  freest=-bolt*log(decon(i,j)*pop(i,j)**(bee/(1d0-bee)))  
++                freest=-bolt*log(decon(i,j))
++
++               elseif(imabp.eq.1)then !WTmetaD
++                  sf=exp(-pop(i,j)/DelT)*omega
++                  freest = bolt*log(sf)-pop(i,j)
++               elseif(imabp.eq.2)then
++        
++
++         fac=(are*bah2+1d0)**scal
++
++         sf=omega*fac/(are*decon(i,j)+1d0)         
++                  freest = bolt*log(sf)-pop(i,j)
++               else
++                  freest=bolt*log(1d0/(log(pop(i,j)+1d0)**scal+1d0)) &
++                       -pop(i,j)                  
++               endif
++
++               freest=freest-bang !put min to zero
++               if(rfree(i,j).lt.4.0d0)then !! lower this and flip i/j in the read in section
++               sumd=sumd+dabs(freest-rfree(i,j))
++               orml = orml+1d0
++               endif
++               write(89,*) at1, at2, freest, decon(i,j)/bah2 !write free energy to fort.89
++            enddo
++            write(89,*)
++         enddo
++         close(89)
++      endif
++
++
++      return
++      end !end the ABP routine(s)-------------------------
++!---------------------------------------------------------
++!---------------------------------------------------------
++!---------------------------------------------------------
++!---------------------------------------------------------
++      subroutine bmdDI(qa,deid,angle)
++      implicit integer*4 (i-n)
++      implicit double precision (a-h,o-z)
++      double precision deid(3,4),qa(12),angle,radian
++      
++      radian = 180d0/acos(-1d0)
++      do i=1,4
++         do  j=1,3
++            deid(j,i)=0d0
++         enddo
++      enddo
++      
++      xia = qa(1)
++      yia = qa(2)
++      zia = qa(3)
++      xib = qa(4)
++      yib = qa(5)
++      zib = qa(6)
++      xic = qa(7)
++      yic = qa(8)
++      zic = qa(9)
++      xid = qa(10)
++      yid = qa(11)
++      zid = qa(12)
++      xba = xib - xia
++      yba = yib - yia
++      zba = zib - zia
++      xcb = xic - xib
++      ycb = yic - yib
++      zcb = zic - zib      
++      xdc = xid - xic
++      ydc = yid - yic
++      zdc = zid - zic
++      xt = yba*zcb - ycb*zba
++      yt = zba*xcb - zcb*xba
++      zt = xba*ycb - xcb*yba
++      xu = ycb*zdc - ydc*zcb
++      yu = zcb*xdc - zdc*xcb
++      zu = xcb*ydc - xdc*ycb
++      xtu = yt*zu - yu*zt
++      ytu = zt*xu - zu*xt
++      ztu = xt*yu - xu*yt
++      rt2 = xt*xt + yt*yt + zt*zt
++      ru2 = xu*xu + yu*yu + zu*zu
++      if(rt2.lt. 0.000000001)then
++       rt2=0.000000001
++      endif
++      if(ru2.lt. 0.000000001)then
++       ru2 = 0.000000001
++      endif
++      rtru = sqrt(rt2 * ru2)
++      if(rtru.ne.0d0)then
++      rcb = sqrt(xcb*xcb + ycb*ycb + zcb*zcb)
++      cosine = (xt*xu + yt*yu + zt*zu) / rtru
++      sine = (xcb*xtu + ycb*ytu + zcb*ztu) / (rcb*rtru)
++      cosine = min(1.0d0,max(-1.0d0,cosine))
++      angle = radian * acos(cosine)
++      if (sine .lt. 0.0d0)  angle = -angle+360d0
++      if(angle.ge.360d0)angle=angle-360d0
++      dedphi = 1d0
++      xca = xic - xia
++      yca = yic - yia
++      zca = zic - zia      
++      xdb = xid - xib
++      ydb = yid - yib
++      zdb = zid - zib
++      dedxt = dedphi * (yt*zcb - ycb*zt) / (rt2*rcb)
++      dedyt = dedphi * (zt*xcb - zcb*xt) / (rt2*rcb)
++      dedzt = dedphi * (xt*ycb - xcb*yt) / (rt2*rcb)
++      dedxu = -dedphi * (yu*zcb - ycb*zu) / (ru2*rcb)
++      dedyu = -dedphi * (zu*xcb - zcb*xu) / (ru2*rcb)
++      dedzu = -dedphi * (xu*ycb - xcb*yu) / (ru2*rcb)
++      dedxia = zcb*dedyt - ycb*dedzt
++      dedyia = xcb*dedzt - zcb*dedxt
++      dedzia = ycb*dedxt - xcb*dedyt
++      dedxib = yca*dedzt - zca*dedyt + zdc*dedyu - ydc*dedzu
++      dedyib = zca*dedxt - xca*dedzt + xdc*dedzu - zdc*dedxu
++      dedzib = xca*dedyt - yca*dedxt + ydc*dedxu - xdc*dedyu
++      dedxic = zba*dedyt - yba*dedzt + ydb*dedzu - zdb*dedyu
++      dedyic = xba*dedzt - zba*dedxt + zdb*dedxu - xdb*dedzu
++      dedzic = yba*dedxt - xba*dedyt + xdb*dedyu - ydb*dedxu
++      dedxid = zcb*dedyu - ycb*dedzu
++      dedyid = xcb*dedzu - zcb*dedxu
++      dedzid = ycb*dedxu - xcb*dedyu
++      deid(1,1) = deid(1,1) + dedxia
++      deid(2,1) = deid(2,1) + dedyia 
++      deid(3,1) = deid(3,1) + dedzia
++      deid(1,2) = deid(1,2) + dedxib
++      deid(2,2) = deid(2,2) + dedyib
++      deid(3,2) = deid(3,2) + dedzib
++      deid(1,3) = deid(1,3) + dedxic
++      deid(2,3) = deid(2,3) + dedyic
++      deid(3,3) = deid(3,3) + dedzic
++      deid(1,4) = deid(1,4) + dedxid
++      deid(2,4) = deid(2,4) + dedyid
++      deid(3,4) = deid(3,4) + dedzid
++      else
++       write(*,*) 'failed dihed'
++       stop
++      endif
++      RETURN
++      END
++END MODULE hello_mod
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/Makefile src/pmemd/src/Makefile
+--- ../../vanilla/amber16/src/pmemd/src/Makefile	2019-09-04 11:59:31.665029000 -0400
++++ src/pmemd/src/Makefile	2019-09-04 13:22:23.363901000 -0400
+@@ -40,7 +40,7 @@
+         parallel_dat$(OSFX) parallel$(OSFX) gb_parallel$(OSFX) \
+         pme_direct$(OSFX) pme_recip_dat$(OSFX) pme_slab_recip$(OSFX) pme_blk_recip$(OSFX) \
+         pme_slab_fft$(OSFX) pme_blk_fft$(OSFX) pme_fft_dat$(OSFX) fft1d$(OSFX) \
+-        bspline$(OSFX) pme_force$(OSFX) pbc$(OSFX) nb_pairlist$(OSFX) gb_ene_hybrid$(OSFX) \
++        bspline$(OSFX) pme_force$(OSFX) hello$(OSFX) pbc$(OSFX) nb_pairlist$(OSFX) gb_ene_hybrid$(OSFX) \
+         nb_exclusions$(OSFX) cit$(OSFX) dynamics$(OSFX) bonds$(OSFX) angles$(OSFX) dihedrals$(OSFX) \
+         extra_pnts_nb14$(OSFX) runmd$(OSFX) loadbal$(OSFX) shake$(OSFX) prfs$(OSFX) mol_list$(OSFX) \
+         runmin$(OSFX) constraints$(OSFX) axis_optimize$(OSFX) gb_ene$(OSFX) veclib$(OSFX) gb_force$(OSFX) \
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/pme_force.F90 src/pmemd/src/pme_force.F90
+--- ../../vanilla/amber16/src/pmemd/src/pme_force.F90	2019-09-04 11:59:31.679733000 -0400
++++ src/pmemd/src/pme_force.F90	2019-09-05 20:10:59.278178000 -0400
+@@ -1376,6 +1376,9 @@
+   use nfe_setup_mod, only : nfe_on_force => on_force
+   use nfe_lib_mod,   only : nfe_init
+ !------------------------------------------------------------------
++! Modified by Parker de Waal---------------------------------------
++  use hello_mod
++!------------------------------------------------------------------
+ 
+   implicit none
+ 
+@@ -1402,14 +1405,19 @@
+   double precision              :: enemap
+   double precision              :: vir_vs_ene
+   integer                       :: alloc_failed
+-  integer                       :: i, j
++  integer                       :: i, j, k 
+   logical                       :: params_may_change
+   logical                       :: onstep
+   double precision              :: net_frcs(3)
+   double precision, allocatable :: img_frc(:,:)
+   double precision              :: evdwex, eelex
+ ! biased forces, added by FENG PAN
+-  double precision              :: bias_frc(3,atm_cnt)
++!  double precision              :: bias_frc(3,atm_cnt)
++! based forces, added by Parker de Waal
++  integer                       :: mABP, np
++  double precision              :: xxff(3,8), xx(3*8), ff(3*8), biasf(3*8), bias_frc(3,8)
++  mABP = 1 ! 0/1 off/on
++  np = 8 ! Number of CV atoms
+ 
+   call zero_time()
+   call zero_pme_time()
+@@ -1482,6 +1490,36 @@
+   endif
+ 
+   call update_time(nonbond_time)
++!------------------------------------
++!--------------fABMACS---------------
++!------------------------------------
++
++ if (mABP.gt.0.AND.nstep.ne.-1) then
++
++  ! download frc/crds
++  call gpu_download_cv_crd(xxff)
++  do i=1,np
++   do k=1,3
++      xx(i*3-(3-k))=xxff(k,i)
++    enddo
++  enddo
++
++  !zero forces and call helof
++  biasf = 0d0
++  call hellof(nstep,xx,biasf)
++  do i=1,np
++    do k=1,3
++      bias_frc(k,i) = biasf(i*3-(3-k))
++    enddo
++  enddo
++
++  ! reupload forces
++  call gpu_upload_cv_frc(bias_frc)
++
++ endif
++!------------------------------------
++!-----------END fABMACS--------------
++!------------------------------------
+ !-------------------------------------
+ !--------------NFE_MOD----------------
+ !-------------------------------------
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/runmd.F90 src/pmemd/src/runmd.F90
+--- ../../vanilla/amber16/src/pmemd/src/runmd.F90	2019-09-04 11:59:31.680970000 -0400
++++ src/pmemd/src/runmd.F90	2019-09-05 20:11:28.059464000 -0400
+@@ -87,6 +87,9 @@
+ #else
+   use nfe_lib_mod, only : nfe_init
+ #endif
++
++! Modified by Parker de Waal---------------------------------------
++  use hello_mod
+ !---------------------------------------------------------------
+ 
+   implicit none
+@@ -226,6 +229,13 @@
+   double precision      :: VmaxDt,VminDt,VavgDt,sigmaVDt
+   double precision      :: VmaxPt,VminPt,VavgPt,sigmaVPt
+ 
++! based forces, added by Parker de Waal
++  integer                       :: mABP, np
++  double precision              :: xxff(3,8), xx(3*8), ff(3*8), biasf(3*8), bias_frc(3,8)
++  mABP = 1 ! 0/1 off/on
++  np = 8 ! Number of CV atoms
++
++
+ ! Runmd operates in kcal/mol units for energy, amu for masses,
+ ! and angstoms for distances.  To convert the input time parameters 
+ ! from picoseconds to internal units, multiply by 20.455 
+@@ -2970,7 +2980,30 @@
+ !--------------------------------------------------------------------
+ !--------------------------------------------------------------------
+ 
+-      if (nstep .ge. nstlim) exit
++      if (nstep .ge. nstlim) then
++!------------------------------------
++!--------------fABMACS---------------
++!------------------------------------
++
++ if (mABP.gt.0.AND.nstep.ne.-1) then
++
++  ! download frc/crds
++  call gpu_download_cv_crd(xxff)
++  do i=1,np
++   do k=1,3
++      xx(i*3-(3-k))=xxff(k,i)
++    enddo
++  enddo
++
++  !zero forces and call helof
++  biasf = 0d0
++  call hellof(nstep,xx,biasf)
++ endif
++!------------------------------------
++!-----------END fABMACS--------------
++!------------------------------------
++       exit
++      endif
+ 
+       ! Stop the run if timlim is set and reached. One more step will be taken
+       ! to ensure a final restart is written.

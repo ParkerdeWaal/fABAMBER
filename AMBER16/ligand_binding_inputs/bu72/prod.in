@@ -1,0 +1,15 @@
+Typical Production MD NPT, MC Bar 2fs
+ &cntrl
+   ntx=5, irest=1,
+   ntc=2, ntf=2, 
+   nstlim=1000000000, 
+   ntpr=50000, ntwx=5000,
+   ntwr=50000,
+   dt=0.002, cut=8.0,
+   ntt=3, gamma_ln=5.0
+   tautp=5.0,
+   temp0=310.0,
+   ntb=2, barostat=2,
+   ntp=3, csurften=3,
+   ioutfm=1, iwrap=1,
+ /

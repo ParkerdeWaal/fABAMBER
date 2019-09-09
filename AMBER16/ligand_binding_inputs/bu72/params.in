@@ -1,0 +1,10 @@
+310.0 !temp in K
+0.9 !b
+0.005 !c
+20.0 !alpha
+18 !cylinder radius
+20.0 !scale
+0 !restart
+20 !max CV value
+0  !min CV value
+7.74 !flim in units of kT ~ 13 kcal/mol

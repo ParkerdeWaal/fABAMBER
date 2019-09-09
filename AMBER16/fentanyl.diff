@@ -1,0 +1,959 @@
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/gpu.cpp src/pmemd/src/cuda/gpu.cpp
+--- ../../vanilla/amber16/src/pmemd/src/cuda/gpu.cpp	2019-09-04 11:59:32.012270000 -0400
++++ src/pmemd/src/cuda/gpu.cpp	2019-09-09 18:13:45.640044000 -0400
+@@ -628,11 +628,15 @@
+     if (gpu->sm_version < SM_2X)
+     {
+         gpu->sim.stride                 = ((*atoms + 31) >> 5) << 5;
++        gpu->sim.CVstride                 = ((8 + 31) >> 5) << 5;       // PWD Set Manually CV Atoms
+     }
+     else
+     {
+         gpu->sim.stride                 = ((*atoms + 63) >> 6) << 6;
++        gpu->sim.CVstride                 = ((8 + 63) >> 6) << 6;       // PWD Set Manually CV Atoms
+     }
++    gpu->sim.CVstride2                    = 2 * gpu->sim.CVstride;
++    gpu->sim.CVstride3                    = 3 * gpu->sim.CVstride;
+     gpu->sim.stride2                    = 2 * gpu->sim.stride;
+     gpu->sim.stride3                    = 3 * gpu->sim.stride;
+     gpu->sim.stride4                    = 4 * gpu->sim.stride;
+@@ -661,6 +665,7 @@
+     }
+ 
+     // Clear any previous stuff
++    delete gpu->pbCVCrd;        // PWD
+     delete gpu->pbAtom;
+     delete gpu->pbAtomXYSP;
+     delete gpu->pbAtomZSP;
+@@ -682,6 +687,7 @@
+     delete gpu->pbCenter;
+     delete gpu->pbRandom;
+     delete gpu->pbTIRegion;
++    gpu->pbCVCrd                        = new GpuBuffer<double>(gpu->sim.CVstride3 * 2);    // PWD
+     gpu->pbAtom                         = new GpuBuffer<double>(gpu->sim.stride3 * 2);
+     gpu->pbAtomXYSP                     = new GpuBuffer<PMEFloat2>(gpu->sim.stride);
+     gpu->pbAtomZSP                      = new GpuBuffer<PMEFloat>(gpu->sim.stride);
+@@ -728,6 +734,7 @@
+     gpu->sim.maxNonbondBuffers          = nonbondForceBuffers * gpu->sim.stride3;    
+  
+     // delete any existing accumulators
++    delete gpu->pbCVFrc;        // PWD
+     delete gpu->pbForceAccumulator;
+     delete gpu->pbReffAccumulator;
+ #ifdef MPI
+@@ -756,6 +763,8 @@
+     }    
+     // Allocate new force accumulators
+     gpu->pbForceAccumulator             = new GpuBuffer<PMEAccumulator>(gpu->sim.stride3 * maxForceBuffers * bufferMultiplier);
++    gpu->pbCVFrc                        = new GpuBuffer<PMEAccumulator>(gpu->sim.CVstride3);    //PWD
++    gpu->sim.pCVFrc                     = gpu->pbCVFrc->_pDevData;                              // PWD
+     gpu->sim.pForceAccumulator          = gpu->pbForceAccumulator->_pDevData;
+     gpu->sim.pForceXAccumulator         = gpu->pbForceAccumulator->_pDevData;
+     gpu->sim.pForceYAccumulator         = gpu->sim.pForceAccumulator + gpu->sim.stride;
+@@ -802,6 +811,7 @@
+     }
+ #endif
+ 
++    gpu->sim.pCVCrd                     = gpu->pbCVCrd->_pDevData;      // PWD
+     gpu->sim.pAtomX                     = gpu->pbAtom->_pDevData;
+     gpu->sim.pAtomY                     = gpu->pbAtom->_pDevData + gpu->sim.stride;
+     gpu->sim.pAtomXYSP                  = gpu->pbAtomXYSP->_pDevData;
+@@ -1283,6 +1293,44 @@
+     } 
+ }
+ 
++// PWD
++extern "C" void gpu_download_cv_crd_(double atm_crd[][3])
++{
++PRINTMETHOD("gpu_download_cv_crd");
++    int np = 7;
++    kCollectCvCrd(gpu);
++    gpu->pbCVCrd->Download();
++    for (int i = 0; i < np; i++)
++        {
++            atm_crd[i][0]                               = gpu->pbCVCrd->_pSysData[i];
++            atm_crd[i][1]                               = gpu->pbCVCrd->_pSysData[i + gpu->sim.CVstride];
++            atm_crd[i][2]                               = gpu->pbCVCrd->_pSysData[i + gpu->sim.CVstride2];
++        }
++    atm_crd[8][0] = gpu->pbCVCrd->_pSysData[gpu->sim.CVstride3];
++    atm_crd[8][1] = gpu->pbCVCrd->_pSysData[gpu->sim.CVstride3 + gpu->sim.CVstride];
++    atm_crd[8][2] = gpu->pbCVCrd->_pSysData[gpu->sim.CVstride3 + gpu->sim.CVstride2];
++    atm_crd[9][0] = gpu->pbCVCrd->_pSysData[gpu->sim.CVstride3 + 1];
++    atm_crd[9][1] = gpu->pbCVCrd->_pSysData[gpu->sim.CVstride3 + gpu->sim.CVstride + 1];  
++    atm_crd[9][2] = gpu->pbCVCrd->_pSysData[gpu->sim.CVstride3 + gpu->sim.CVstride2 + 1];
++    atm_crd[10][0] = (atm_crd[8][0]+atm_crd[9][0])/2;
++    atm_crd[10][1] = (atm_crd[8][1]+atm_crd[9][1])/2;
++    atm_crd[10][2] = (atm_crd[8][2]+atm_crd[9][2])/2;
++}
++
++extern "C" void gpu_upload_cv_frc_(double atm_frc[][3])
++{
++PRINTMETHOD("gpu_upload_cv_frc");
++    int np = 7;
++    for (int i = 0; i < np; i++)
++        {
++            gpu->pbCVFrc->_pSysData[i]                      = (PMEAccumulator)(FORCESCALE * atm_frc[i][0]);
++            gpu->pbCVFrc->_pSysData[i + gpu->sim.CVstride]  = (PMEAccumulator)(FORCESCALE * atm_frc[i][1]);
++            gpu->pbCVFrc->_pSysData[i + gpu->sim.CVstride2] = (PMEAccumulator)(FORCESCALE * atm_frc[i][2]);
++        }
++    gpu->pbCVFrc->Upload();
++    kAddCvFrc(gpu);
++}
++
+ extern "C" void gpu_upload_frc_(double atm_frc[][3])
+ {
+ PRINTMETHOD("gpu_upload_frc");
+@@ -8447,11 +8495,15 @@
+     if (gpu->sm_version < SM_2X)
+     {
+         gpu->sim.stride                 = ((*natoms + 31) >> 5) << 5;
++        gpu->sim.CVstride               = ((8 + 31) >> 5) << 5;       // PWD Set Manually CV Atoms
+     }
+     else
+     {
+         gpu->sim.stride                 = ((*natoms + 63) >> 6) << 6;
++        gpu->sim.CVstride               = ((8 + 63) >> 6) << 6;       // PWD Set Manually CV Atoms
+     }
++    gpu->sim.CVstride2                    = 2 * gpu->sim.CVstride;  // PWD
++    gpu->sim.CVstride3                    = 3 * gpu->sim.CVstride;
+     gpu->sim.stride2                    = 2 * gpu->sim.stride;
+     gpu->sim.stride3                    = 3 * gpu->sim.stride;
+     gpu->sim.stride4                    = 4 * gpu->sim.stride;
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/gpu.h src/pmemd/src/cuda/gpu.h
+--- ../../vanilla/amber16/src/pmemd/src/cuda/gpu.h	2019-09-04 11:59:29.987273000 -0400
++++ src/pmemd/src/cuda/gpu.h	2019-09-09 16:25:04.855811000 -0400
+@@ -16,6 +16,8 @@
+ #define __GPU_H__
+ #include "gputypes.h"
+ // F95 interface
++extern "C" void gpu_download_cv_crd_(double atm_crd[][3]); // PWD
++extern "C" void gpu_upload_cv_frc_(double atm_frc[][3]); // PWD
+ extern "C" void gpu_init_(void);
+ extern "C" void gpu_shutdown_(void);
+ extern "C" void gpu_setup_system_(int* atoms, int* imin, double* tol, int* ntf, int* ntb, int* ips, int* ntp, int* barostat, int* ntt, int* gbsa, int* vrand, int* icnstph, int* ti_mode);
+@@ -202,6 +204,8 @@
+ extern "C" void kCalculateGAMDWeights(gpuContext gpu);
+ extern "C" void kCalculateGAMDWeightAndScaleForces(gpuContext gpu, PMEDouble pot_ene_tot, PMEDouble dih_ene_tot, PMEDouble fwgt);
+ extern "C" void kCalculateGAMDDihedralEnergy(gpuContext gpu);
++extern "C" void kCollectCvCrd(gpuContext gpu);  // PWD
++extern "C" void kAddCvFrc(gpuContext gpu);      // PWD
+ extern "C" void kScaledMDScaleForces(gpuContext gpu, PMEDouble pot_ene_tot, PMEDouble lambda);
+ #ifdef MPI
+ extern "C" void kCopyToAccumulator(gpuContext gpu, PMEAccumulator* p1, PMEAccumulator* p2, int size);
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/gputypes.cpp src/pmemd/src/cuda/gputypes.cpp
+--- ../../vanilla/amber16/src/pmemd/src/cuda/gputypes.cpp	2019-09-04 11:59:29.987870000 -0400
++++ src/pmemd/src/cuda/gputypes.cpp	2019-09-09 16:25:04.857344000 -0400
+@@ -69,6 +69,7 @@
+     sim.fac2                    = 0.0;
+     sim.is_orthog               = true;
+     sim.paddedNumberOfAtoms     = 0;
++    sim.pCVCrd                  = NULL;     // PWD
+     sim.pAtomX                  = NULL;
+     sim.pAtomY                  = NULL;
+     sim.pAtomXYSP               = NULL;
+@@ -306,6 +307,7 @@
+     sim.pForceXAccumulator      = NULL;
+     sim.pForceYAccumulator      = NULL;
+     sim.pForceZAccumulator      = NULL;
++    sim.pCVFrc                  = NULL; //PWD
+     sim.pNBForceAccumulator     = NULL;
+     sim.pNBForceXAccumulator    = NULL;
+     sim.pNBForceYAccumulator    = NULL;
+@@ -636,6 +638,8 @@
+ step(0),
+ forwardPlan(0),
+ backwardPlan(0),
++pbCVCrd(NULL),  //PWD
++pbCVFrc(NULL),  //PWD
+ pbAtom(NULL),
+ pbAtomXYSP(NULL),
+ pbAtomZSP(NULL),
+@@ -932,6 +936,8 @@
+ _gpuContext::~_gpuContext()
+ {
+     // Delete Atom data
++    delete pbCVCrd;         //PWD
++    delete pbCVFrc;         //PWD
+     delete pbAtom;
+     delete pbAtomXYSP;
+     delete pbAtomZSP;    
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/gputypes.h src/pmemd/src/cuda/gputypes.h
+--- ../../vanilla/amber16/src/pmemd/src/cuda/gputypes.h	2019-09-04 11:59:29.988632000 -0400
++++ src/pmemd/src/cuda/gputypes.h	2019-09-09 16:25:04.858660000 -0400
+@@ -903,6 +903,7 @@
+ #endif
+         
+     // Atom stuff
++    double*                     pCVCrd;                             // PWD
+     double*                     pAtomX;                             // Atom X coordinates
+     double*                     pAtomY;                             // Atom Y coordinates
+     double*                     pAtomZ;                             // Atom Z coordinates
+@@ -1409,6 +1410,10 @@
+     PMEAccumulator*             pBondedForceXAccumulator;           // Bare fixed point bonded x force accumulator   
+     PMEAccumulator*             pBondedForceYAccumulator;           // Bare fixed point bonded y force accumulator   
+     PMEAccumulator*             pBondedForceZAccumulator;           // Bare fixed point bonded z force accumulator
++    PMEAccumulator*             pCVFrc;                             // PWD CV Forces
++    int                         CVstride;                           // CVAtom quantity stride
++    int                         CVstride2;                          // CVAtom quantity 2x stride
++    int                         CVstride3;                          // CVAtom quantity 3x stride
+     int                         stride;                             // Atom quantity stride
+     int                         stride2;                            // Atom quantity 2x stride
+     int                         stride3;                            // Atom quantity 3x stride
+@@ -1460,6 +1465,7 @@
+     bool                        bCPURandoms;                // Generate random numbers on CPU instead of GPU
+ 
+     // Atom stuff
++    GpuBuffer<double>*          pbCVCrd;                    // PWD CRD Atoms
+     GpuBuffer<double>*          pbAtom;                     // Atom coordinates
+     GpuBuffer<PMEFloat2>*       pbAtomXYSP;                 // Single Precision Atom X and Y coordinates    
+     GpuBuffer<PMEFloat>*        pbAtomZSP;                  // Single Precision Atom Z coordinate
+@@ -1730,6 +1736,7 @@
+     GpuBuffer<PMEAccumulator>*  pbReffAccumulator;          // Effective Born Radius accumulator
+     GpuBuffer<PMEAccumulator>*  pbSumdeijdaAccumulator;     // Sumdeijda accumulator
+     GpuBuffer<PMEAccumulator>*  pbForceAccumulator;         // Force accumulators
++    GpuBuffer<PMEAccumulator>*  pbCVFrc;                    // Force accumulators PWD
+     GpuBuffer<unsigned long long int>*   pbEnergyBuffer;    // Energy accumulation buffer
+     GpuBuffer<KineticEnergy>*   pbKineticEnergyBuffer;      // Kinetic energy accumulation buffer
+     
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/cuda/kForcesUpdate.cu src/pmemd/src/cuda/kForcesUpdate.cu
+--- ../../vanilla/amber16/src/pmemd/src/cuda/kForcesUpdate.cu	2019-09-04 11:59:29.992475000 -0400
++++ src/pmemd/src/cuda/kForcesUpdate.cu	2019-09-09 18:15:48.287922000 -0400
+@@ -1110,6 +1110,92 @@
+     LAUNCHERROR("kLocalToGlobal");
+ }
+ 
++//PWD
++__global__ void
++#if (__CUDA_ARCH__ >= 300)
++__launch_bounds__(SM_3X_GENERAL_THREADS_PER_BLOCK, 1)
++#else
++__launch_bounds__(SM_2X_GENERAL_THREADS_PER_BLOCK, 1)
++#endif
++kCollectCvCrd_kernel()
++{
++    __threadfence();
++    __syncthreads();
++    unsigned int myatoms [] = {4673, 4671, 4669, 4667, 4678, 4657, 4661};         // PWD CV Atoms indexing begins at 0
++    for (int i = 0; i < 7; i++)
++    {
++        int p1 = cSim.pImageAtomLookup[myatoms[i]];
++        cSim.pCVCrd[i] = cSim.pImageX[p1];
++        cSim.pCVCrd[i + cSim.CVstride] = cSim.pImageY[p1];
++        cSim.pCVCrd[i + cSim.CVstride2] = cSim.pImageZ[p1];
++    }
++    unsigned int COM1 [] = {795,805,817,827,846,856,870,881,895,916,928,1233,1252,1268,1287,1298,1317,1329,1350,1371,1385,1402,1422,1436,1447,1466,4066,4077,4096,4106,4125,4132,4153,4167,4181,4192}; // 36
++    unsigned int COM2 [] = {1233,1252,1268,1287,1298,1317,1329,1350,1371,1385,1402,1422,1436,1447,1466,2761,2777,2797,2816,2836,2846,2866,2885,2904,2916,2932,3522,3542,3561,3577,3588,3612,3628,3640,3659}; // 35
++
++    PMEDouble com1X = 0.0;
++    PMEDouble com1Y = 0.0;
++    PMEDouble com1Z = 0.0;
++    PMEDouble com2X = 0.0;
++    PMEDouble com2Y = 0.0;
++    PMEDouble com2Z = 0.0;
++
++    for (int i = 0; i < 36; i++)
++    {
++        int p1 = cSim.pImageAtomLookup[COM1[i]];
++        com1X += cSim.pImageX[p1];
++        com1Y += cSim.pImageY[p1];
++        com1Z += cSim.pImageZ[p1];
++    }
++
++    cSim.pCVCrd[cSim.CVstride3]                     = com1X/36;
++    cSim.pCVCrd[cSim.CVstride3 + cSim.CVstride]     = com1Y/36;
++    cSim.pCVCrd[cSim.CVstride3 + cSim.CVstride2]    = com1Z/36;
++
++    for (int i = 0; i < 35; i++)
++    {
++        int p1 = cSim.pImageAtomLookup[COM2[i]];
++        com2X += cSim.pImageX[p1];
++        com2Y += cSim.pImageY[p1];
++        com2Z += cSim.pImageZ[p1];
++    }
++
++    cSim.pCVCrd[cSim.CVstride3 + 1]                     = com2X/35;
++    cSim.pCVCrd[cSim.CVstride3 + cSim.CVstride + 1]     = com2Y/35;
++    cSim.pCVCrd[cSim.CVstride3 + cSim.CVstride2 + 1]    = com2Z/35;
++}
++
++void kCollectCvCrd(gpuContext gpu)
++{
++    kCollectCvCrd_kernel<<<gpu->blocks, gpu->generalThreadsPerBlock>>>();
++    LAUNCHERROR("kCollectCvCrd");
++}
++
++__global__ void
++#if (__CUDA_ARCH__ >= 300)
++__launch_bounds__(SM_3X_GENERAL_THREADS_PER_BLOCK, 1)
++#else
++__launch_bounds__(SM_2X_GENERAL_THREADS_PER_BLOCK, 1)
++#endif
++kAddCvFrc_kernel()
++{
++    __threadfence();
++    unsigned int myatoms [] = {4673, 4671, 4669, 4667, 4678, 4657, 4661};         // PWD CV Atoms indexing begins at 0
++    for (int i = 0; i < 7; i++)
++    {
++        int p1 = cSim.pImageAtomLookup[myatoms[i]];
++        cSim.pForceAccumulator[p1]                                      += cSim.pCVFrc[i];
++        cSim.pForceAccumulator[p1 + cSim.stride]                        += cSim.pCVFrc[i + cSim.CVstride];
++        cSim.pForceAccumulator[p1 + cSim.stride2]                       += cSim.pCVFrc[i + cSim.CVstride2];
++    }
++}
++
++void kAddCvFrc(gpuContext gpu)
++{
++//    kAddCvFrc_kernel<<<gpu->blocks, gpu->generalThreadsPerBlock>>>();
++    kAddCvFrc_kernel<<<1, 1>>>();
++
++    LAUNCHERROR("kCollectCvCrd");
++}
+ 
+ __global__ void
+ #if (__CUDA_ARCH__ >= 300)
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/f90depends src/pmemd/src/f90depends
+--- ../../vanilla/amber16/src/pmemd/src/f90depends	2019-09-04 11:59:31.665532000 -0400
++++ src/pmemd/src/f90depends	2019-09-09 16:25:04.860934000 -0400
+@@ -701,6 +701,7 @@
+ pme_fft_dat$(OSFX): parallel_dat$(OSFX)
+ pme_fft_dat$(OSFX): pmemd_lib$(OSFX)
+ pme_fft_dat$(OSFX): copyright.i
++pme_force$(OSFX): hello$(OSFX)
+ pme_force$(OSFX): gbl_datatypes$(OSFX)
+ pme_force$(OSFX): prmtop_dat$(OSFX)
+ pme_force$(OSFX): energy_records$(OSFX)
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/hello.F90 src/pmemd/src/hello.F90
+--- ../../vanilla/amber16/src/pmemd/src/hello.F90	1969-12-31 19:00:00.000000000 -0500
++++ src/pmemd/src/hello.F90	2019-09-09 18:32:29.671171000 -0400
+@@ -0,0 +1,455 @@
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++!
++! fABAMBER16 port and modifications by PWD, origianlly implemented by BMD
++! as described in https://doi.org/10.1063/1.4964776
++! 
++! Includes overfill protection as described in 
++! https://doi.org/10.1021/acs.jctc.7b00821
++!
++! mABP using RMSD CVs using mobile reference points generated during each
++! timestep -- used to dock ligands into GPCRs
++!
++!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
++MODULE hello_mod
++!implicit none
++
++contains
++
++subroutine hellof(istep,xx,ff,refCom,cylCom)
++
++      implicit integer*4 (i-n)
++      implicit double precision (a-h,o-z)      
++      double precision bigd(480,480)
++      double precision dpop(2,480,480),pop(480,480)
++      double precision dela(3,480,480),ddela(480,480)
++      double precision decon(480,480),  widths(3)
++!      double precision x0(NPARTS*3),ocog(3) 
++!      double precision xwrp(NPARTS*3)!HYPER,statea,time,plat,dtime
++      double precision alp,bee,cee,width,dih,DelT,desto,flim,maxe,mine
++      double precision bolt,dx,radius,scal,omega,const,bangG,obangG
++!HYPER      double precision ASTATE1,ASTATE2,BSTATE1,BSTATE2
++      double precision point(2,3),ormal(3),ormli, cylheight
++      integer ialp,ltime
++      integer nbin,imabp,np,np1,np2
++      save !and save the stuff
++
++      double precision ff(7*3),xx(7*3), cylCom(2,3), refCom(2,3)
++!      double precision widths24(3), widths2(3)
++      double precision jaco(2,7*3),cog(3) !with ALY      !aly
++      double precision deid(3,4),qa(12)!for dihedral restraint
++      double precision ave1(2),freest
++      double precision orml,sumd,at1,at2,bang,arg
++
++
++      if(istep.eq.0)then
++!HYPER         time=0d0
++!HYPER         statea=0d0
++         bangG=0d0
++         obangG=0d0
++         const=0d0
++         ltime=0
++
++!CYLN         open(13,file="cylpoints")
++!CYLN         do i=1,2
++!CYLN            do j=1,3
++!CYLN               read(13,*) point(i,j)
++!CYLN            enddo
++!CYLN         enddo
++!CYLN         close(13)
++         !get norm once
++
++         sum=0d0
++         do j=1,3
++            sum=sum+(cylCom(2,j)-cylCom(1,j))**2
++         enddo
++         sum=sqrt(sum)
++         do j=1,3
++            ormal(j)=(cylCom(2,j)-cylCom(1,j))/sum
++         enddo
++
++!SPHR         open(13,file="sphpoints")!replaced width/2 as sphere center
++!SPHR         do i=1,1
++!SPHR            do j=1,3
++!SPHR               read(13,*) point(i,j)
++!SPHR            enddo
++!SPHR         enddo
++         
++         bah=1d0
++         bah2 = 1d0
++         bah3=0d0
++         nbin = 480 !number of bins 
++         np=7
++
++         np1=4
++         np2=3
++
++         open(11,file='params.in') !user inputs
++         read(11,*) temperature
++         read(11,*) bee !b parameter in mABP
++         read(11,*) cee !c parameter in mABP (is taken as c*dt)
++         read(11,*) alp !a/dx in S_a
++!         read(11,*) (widths(j),j=1,3) ! rectangular
++         read(11,*) radius !sphere or cyl restraint
++         read(11,*) scal !power for shape
++         read(11,*) irest !restart or not
++         read(11,*) maxe
++         read(11,*) mine
++         read(11,*) flim !fill limit in units of kT
++!HYPER         read(11,*) ASTATE1, ASTATE2, BSTATE1, BSTATE2
++!HYPER         read(11,*) dtime
++         bolt = 8.31441d-3 * temperature / 4.184d0
++         imabp=0
++!HYPER         plat=bee*bolt*log(cee*bee*0d0+1d0)/(1d0-bee)
++         close(11) !close it
++!WTmetaD         omega = bolt*bee*cee !WTmetaD conversion, and muTmetaD
++!WTmetaD         DelT = bolt*bee/(1d0-bee) !ditto
++
++         pi=acos(-1d0) !have some pi
++         pi2=pi*2d0    !twice
++         dx = 60d0/dble(nbin) !grid width
++         tol = alp*dx
++         tol2=4d0*dx !not too small...
++         ialp = int(alp)
++         do j=1,nbin !pre-compute delta_alpha "hill functions"
++            xatj = (j-1)*dx
++            do i=1,nbin
++               xati = (i-1)*dx
++               arg2=xati-xatj
++               ib1 = int((arg2)/dx)+1      !theres an issue here
++               if(ib1.gt.nbin)ib1=nbin
++               if(ib1.lt.1)ib1=1     
++               ib1=nbin*i-(nbin-j)!ib1
++
++!-----MOLLIIIIIII
++               ex = arg2/tol
++               aex=ex*ex
++               aex=sqrt(aex)
++               aex2=aex*aex
++               func=0d0
++               dermoli=0d0
++               if(aex.lt.1d0)then
++                  func = exp(-scal/(1d0-aex2))/exp(-scal) !so height is 1 at x=0
++                  aa=scal*func/((1d0-aex2)*(1d0-aex2))!should be negative?
++                  dermoli=aa*2d0*ex/tol
++               endif
++               dela(1,i,j)=func
++                ddela(i,j) =dermoli
++!--------------------------------------------------------------------
++!              this is used for the "vanishingly small" alpha,
++!     do be careful here...
++               ex2 = arg2/tol2
++               aex2=ex2*ex2
++               aex2=sqrt(aex2)
++               aex22=aex2*aex2
++               if(aex2.lt.1d0)then
++                  func2 = exp(-20d0/(1d0-aex22))/exp(-20d0) !so height is 1 at x=0
++               else
++                  func2=0d0
++               endif
++               dela(2,i,j)=func2!exp(-arg2*arg2/2d0**2)  !for mabp stuff and muTmetaD
++!----------MOLLLIIIII DD
++            enddo
++         enddo
++
++
++         do j=1,nbin
++            do i=1,nbin                  
++               pop(i,j) = 0d0   !initialize arrays
++               if(imabp.eq.0)then
++               decon(i,j)=0.1d0 !to avoid log(0)
++               else
++               decon(i,j)=0d0
++               endif
++               dpop(1,i,j) = 0d0
++               dpop(2,i,j) = 0d0
++            enddo
++         enddo
++         if(irest.eq.1)then
++            open(99,file='restartABP')
++            do j=1,nbin
++               do i=1,nbin
++                  read(99,111) pop(i,j), dpop(1,i,j), dpop(2,i,j), &
++                      decon(i,j)!HYPER, plat
++               enddo
++            enddo
++            close(99)
++         endif
++         sum=0d0
++         do i=nbin/2-60,nbin/2+60
++            sum=sum+dela(1,i,nbin/2)
++         enddo
++         ormli=sum*sum !90% fudger
++
++      endif                     !end the initial stuff
++
++!!  SET x0 CORDS FROM CENTER OF RECEPTOR!!!!!!!
++
++
++      jaco = 0d0 !this will hold the RMSD derivative
++      !angl1 and angl2 are the CV-in RMSD
++      sum=0d0
++      do i=1,np1!np1 particles in here
++         do j=1,3
++            ip=i
++            sum=sum+(xx(ip*3-(3-j))-refCom(1,j))**2
++            jaco(1,ip*3-(3-j))=(xx(ip*3-(3-j))-refCom(1,j))
++         enddo
++      enddo
++      angl1=sqrt(0.01d0+sum/dble(np1)/3d0) !root-mean squared
++      sum=0d0
++      do i=1,np2
++         do j=1,3
++            ip=i+np1
++            sum=sum+(xx(ip*3-(3-j))-refCom(2,j))**2
++            jaco(2,ip*3-(3-j))=(xx(ip*3-(3-j))-refCom(2,j))
++         enddo
++      enddo
++      angl2=sqrt(0.01d0+sum/dble(np2)/3d0) !root-mean squared
++      do i=1,np1
++         do j=1,3
++            ip=i*3-(3-j)
++            jaco(1,ip)=jaco(1,ip)/angl1/3d0/dble(np1)
++         enddo
++      enddo
++      do i=1,np2
++         do j=1,3
++            ip=(i+np1)*3-(3-j)
++            jaco(2,ip)=jaco(2,ip)/angl2/3d0/dble(np2)
++         enddo
++      enddo
++
++      ibin = int(angl1/dx)+1      
++      if(ibin.gt.nbin)ibin=nbin
++      if(ibin.lt.1)ibin=1     
++      ibin1=ibin
++      ibin = int(angl2/dx)+1      
++      if(ibin.gt.nbin)ibin=nbin
++      if(ibin.lt.1)ibin=1     
++      ibin2=ibin
++      denom = 1d0+cee*(1d0-bee)*pop(ibin1,ibin2)            
++!HYPER      pwr=bee/(1d0-bee)!         !
++!HYPER      boost=denom**pwr!          !carve these out on PATCH flag
++!HYPER      boost=boost*exp(-plat/bolt)!
++!HYPER      ltime=50000 !dephase time, in steps
++!HYPER      if(angl1.lt.ASTATE1.and.angl2.lt.ASTATE2.and.istep.gt.ltime)then !statea
++!HYPER         statea=statea+dtime*boost 
++!HYPER         time=time+dtime
++!HYPER      elseif(angl1.gt.BSTATE1.or.angl2.gt.BSTATE2)then
++!HYPER         write(87,*) statea, statea/time, boost !can do post proc 
++!HYPER         call flush(87)
++!HYPER         open(99,file='restartABP')
++!HYPER         do j=1,nbin
++!HYPER            do i=1,nbin
++!HYPER               write(99,111) pop(i,j), dpop(1,i,j), dpop(2,i,j), 
++!HYPER     .              decon(i,j), plat
++!HYPER            enddo
++!HYPER         enddo
++!HYPER         close(99)
++!HYPER         stop
++!HYPER      endif!patchscript flag
++
++!-------------------------------------------------------------------------
++!      UPDATE THE BIAS POTENTIAL HERE ---
++!-------------------------------------------------------------------------
++
++!WTmetaD      ave1(1) = -dpop(1,ibin1,ibin2)
++!WTmetaD      ave1(2) = -dpop(2,ibin1,ibin2)            
++!WTmetaD      s=exp(-pop(ibin1,ibin2)/DelT)*omega
++
++      ave1(1) = -cee*bee*bolt*dpop(1,ibin1,ibin2)/denom 
++      ave1(2) = -cee*bee*bolt*dpop(2,ibin1,ibin2)/denom 
++      !update grids, if hyperd then delay by ltime
++     if(const.le.pop(ibin1,ibin2).and.istep.gt.ltime)then
++      decon(ibin1,ibin2)=decon(ibin1,ibin2)+1d0
++      jst=ibin2-(ialp+1) !11 because used 10 in def of tol
++      jst=max(jst,1)
++      jnd=ibin2+(ialp+1)
++      jnd=min(nbin,jnd)
++      do j =jst,jnd!1,nbin!jst,jnd!1,nbin!jst,jnd
++         boomc= dela(2,ibin2,j) !this is hill with "vanishingly small" width
++         booma=dela(1,ibin2,j)  !this is hill for biasing
++         ist=ibin1-(ialp+1)           !11 because used 10 in def of tol
++         ist=max(ist,1)
++         ind=ibin1+(ialp+1)
++         ind=min(nbin,ind)
++         do i = ist,ind!1,nbin!ist,ind!1,nbin
++            boomcc= dela(2,ibin1,i)!second part of "vanishingly small" width
++            boom = dela(1,ibin1,i)*booma ! product of two hills for bias
++!WTmetaD            pop(i,j) = pop(i,j) + boom*s
++            pop(i,j) = pop(i,j) + boom
++            if(pop(i,j).gt.bangG)bangG=pop(i,j)
++!deconvoluted free energy estimate ------------------------------
++!            decon(i,j)=decon(i,j)+boomcc*boomc !pushed outside now
++!----------------------------------------------------------------
++!WTmetaD            dpop(1,i,j) = dpop(1,i,j)+ddela(ibin1,i)
++!WTmetaD     .      *dela(1,ibin2,j)*s
++!WTmetaD            dpop(2,i,j) = dpop(2,i,j)+ddela(ibin2,j)
++!WTmetaD     .          *dela(1,ibin1,i)*s
++            dpop(1,i,j) = dpop(1,i,j)+ddela(ibin1,i) &
++             *dela(1,ibin2,j)
++            dpop(2,i,j) = dpop(2,i,j)+ddela(ibin2,j) &
++               *dela(1,ibin1,i)
++         enddo
++      enddo
++      endif!ltime
++
++      if(obangG.ne.bangG)then!update some stuff
++         obangG=bangG
++         const=(cee*(1d0-bee)*bangG+1d0)*exp(-(1d0-bee)*flim/bolt)-1d0
++         const=const/(cee*(1d0-bee))
++         desto=0d0
++         do j=1,nbin
++            do i=1,nbin
++               if(pop(i,j).lt.const)then
++                  pop(i,j)=const
++                  dpop(1,i,j)=0d0
++                  dpop(2,i,j)=0d0
++               endif
++            enddo
++         enddo
++         desto=const/ormli
++         do j=1,nbin
++            do i=1,nbin
++               if(decon(i,j).lt.desto)decon(i,j)=desto
++            enddo
++         enddo
++!HYPER         plat =bee*bolt*log(cee*(1d0-bee)*const+1d0)/(1d0-bee) 
++      endif!patch flag
++
++
++!----------------------------------------------------------------------
++
++!Add the bias forces back to system force
++      fr1=0d0
++      fr2=0d0
++!      edge=maxe 
++      if(angl1.gt.maxe)then
++         fr1=-100d0*bolt*(angl1-maxe)
++      endif
++      if(angl2.gt.maxe)then
++         fr2=-100d0*bolt*(angl2-maxe)
++      endif
++!      mini=25d0
++      if(angl1.lt.mine)then
++         fr1=100d0*bolt*(mine-angle)
++      endif
++      if(angl2.lt.mine)then
++         fr2=100d0*bolt*(mine-angl2)
++      endif
++
++
++      ff=0d0
++      sp=400d0*bolt !or want 100?
++
++!SPHR      do i=1,np
++!SPHR         sum=0d0
++!SPHR         do j=1,3
++!SPHR            ip=i*3-(3-j)
++!SPHR            ff(ip) = ff(ip)+(ave1(1)+fr1)*jaco(1,ip)+
++!SPHR     .           (ave1(2)+fr2)*jaco(2,ip)
++!SPHR            sum=sum+(xx(ip)-point(1,j))*(xx(ip)-point(1,j))
++! this restrains to the box exactly. i didn't like it so much.
++
++!SPHR         enddo
++!SPHR         sum=sqrt(sum)
++!SPHR         if(sum.gt.radius)then!sphere restraint
++!SPHR            do j=1,3
++!SPHR               ip=i*3-(3-j)
++!SPHR               ff(ip) = ff(ip)-sp*(sum-radius)*(xx(ip)-point(1,j))/sum
++!SPHR            enddo
++!SPHR         endif
++!SPHR      enddo
++
++      do i=1,np
++         dd=0d0
++         do j=1,3
++            ip=i*3-(3-j)
++            dd=((xx(ip)-cylCom(1,j))*ormal(j))* &
++                 ((xx(ip)-cylCom(1,j))*ormal(j))+dd
++         enddo
++         dd=sqrt(dd)!this is d
++         rr=0d0
++         do j=1,3
++            ip=i*3-(3-j)
++            rr=(xx(ip)-(cylCom(1,j)+dd*ormal(j)))**2+rr
++         enddo
++         rr=sqrt(rr)!this is R
++         fcyl=0d0
++         if(rr.gt.radius)fcyl=-sp*(rr-radius)
++         sum=0d0
++         do j=1,3
++            ip=i*3-(3-j)
++            ff(ip) = ff(ip)+(ave1(1)+fr1)*jaco(1,ip)+ &
++                 (ave1(2)+fr2)*jaco(2,ip) &
++                 +fcyl*(xx(ip)-(cylCom(1,j)+dd*ormal(j)))
++         enddo
++      enddo
++
++
++
++
++!----------------------------------------------------------------------
++!     Write a restart file and get convergence curve
++      if(mod(istep,5000).eq.0)then
++!      if(1.eq.1)then
++         write(81,*) np + 3
++         write(81,*)
++         do i=1,np
++            write(81,*) 'C ', xx(i*3-(3-1)), xx(i*3-(3-2)), xx(i*3-(3-3))
++         enddo
++         write(81,*) 'C ', refCom(1,1),refCom(1,2),refCom(1,3)
++         write(81,*) 'C ', refCom(2,1),refCom(2,2),refCom(2,3)
++         write(81,*) 'C ', cylCom(1,1),cylCom(1,2),cylCom(1,3)
++         call flush(81)
++
++!                 TimeStep, CV1, CV2, hill height
++         write(88,*) istep, angl1, angl2, &
++             cee*bee*bolt/(1d0+cee*(1d0-bee)*pop(ibin1,ibin2))  !last dist to middl
++!WTmetaD     .        s  !last dist to middl
++!HYPER     .       ,statea, time
++         call flush(88) !write to fort.88
++
++       endif
++       if(mod(istep,50000).eq.0)then
++         open(99,file='restartABP')
++         do j=1,nbin
++            do i=1,nbin
++               write(99,111) pop(i,j), dpop(1,i,j), dpop(2,i,j),  &
++                   decon(i,j)!HYPER, plat
++            enddo
++         enddo
++         close(99)
++         !Get the zero-of energy
++         bang=0d0    
++         do j=1,nbin
++            do i=1,nbin
++!WTmetaD               sf=exp(-pop(i,j)/DelT)*omega
++!WTmetaD               freest = bolt*log(sf)-pop(i,j)
++                  freest=-bolt*log(decon(i,j)*pop(i,j)**(bee/(1d0-bee)))               
++               if(freest.lt.bang)bang=freest !Sets the zero
++            enddo
++         enddo
++         er = 0d0
++         open(89,file='freeE')
++         sumd=0d0
++         orml=0d0
++         do j=1,nbin
++            at2 = dx * (dble(j) - 0.5d0)
++            do i=1,nbin           
++               at1 = dx * (dble(i) - 0.5d0)
++!WTmetaD               sf=exp(-pop(i,j)/DelT)*omega
++!WTmetaD               freest = bolt*log(sf)-pop(i,j)
++                  freest=-bolt*log(decon(i,j)*pop(i,j)**(bee/(1d0-bee)))               
++               freest=freest-bang !put min to zero
++               write(89,*) at1, at2, freest, decon(i,j) !write free energy to fort.89
++            enddo
++            write(89,*)
++         enddo
++         close(89)
++77777    continue
++      endif
++
++ 111   format(4(E12.5,1X))
++      RETURN
++      END
++END MODULE hello_mod
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/Makefile src/pmemd/src/Makefile
+--- ../../vanilla/amber16/src/pmemd/src/Makefile	2019-09-04 11:59:31.665029000 -0400
++++ src/pmemd/src/Makefile	2019-09-09 16:25:04.864142000 -0400
+@@ -40,7 +40,7 @@
+         parallel_dat$(OSFX) parallel$(OSFX) gb_parallel$(OSFX) \
+         pme_direct$(OSFX) pme_recip_dat$(OSFX) pme_slab_recip$(OSFX) pme_blk_recip$(OSFX) \
+         pme_slab_fft$(OSFX) pme_blk_fft$(OSFX) pme_fft_dat$(OSFX) fft1d$(OSFX) \
+-        bspline$(OSFX) pme_force$(OSFX) pbc$(OSFX) nb_pairlist$(OSFX) gb_ene_hybrid$(OSFX) \
++        bspline$(OSFX) pme_force$(OSFX) hello$(OSFX) pbc$(OSFX) nb_pairlist$(OSFX) gb_ene_hybrid$(OSFX) \
+         nb_exclusions$(OSFX) cit$(OSFX) dynamics$(OSFX) bonds$(OSFX) angles$(OSFX) dihedrals$(OSFX) \
+         extra_pnts_nb14$(OSFX) runmd$(OSFX) loadbal$(OSFX) shake$(OSFX) prfs$(OSFX) mol_list$(OSFX) \
+         runmin$(OSFX) constraints$(OSFX) axis_optimize$(OSFX) gb_ene$(OSFX) veclib$(OSFX) gb_force$(OSFX) \
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/pme_force.F90 src/pmemd/src/pme_force.F90
+--- ../../vanilla/amber16/src/pmemd/src/pme_force.F90	2019-09-04 11:59:31.679733000 -0400
++++ src/pmemd/src/pme_force.F90	2019-09-09 18:33:08.632284000 -0400
+@@ -1376,6 +1376,9 @@
+   use nfe_setup_mod, only : nfe_on_force => on_force
+   use nfe_lib_mod,   only : nfe_init
+ !------------------------------------------------------------------
++! Modified by Parker de Waal---------------------------------------
++  use hello_mod
++!------------------------------------------------------------------
+ 
+   implicit none
+ 
+@@ -1402,14 +1405,20 @@
+   double precision              :: enemap
+   double precision              :: vir_vs_ene
+   integer                       :: alloc_failed
+-  integer                       :: i, j
++  integer                       :: i, j, k 
+   logical                       :: params_may_change
+   logical                       :: onstep
+   double precision              :: net_frcs(3)
+   double precision, allocatable :: img_frc(:,:)
+   double precision              :: evdwex, eelex
+ ! biased forces, added by FENG PAN
+-  double precision              :: bias_frc(3,atm_cnt)
++!  double precision              :: bias_frc(3,atm_cnt)
++! based forces, added by Parker de Waal
++  integer                       :: mABP, np
++  double precision              :: xxff(3,16), xx(3*7), ff(3*7), biasf(3*7), bias_frc(3,7)
++  double precision              :: refCom(2,3), cylCom(2,3)
++  mABP = 1 ! 0/1 off/on
++  np = 7 ! Number of CV atoms
+ 
+   call zero_time()
+   call zero_pme_time()
+@@ -1483,6 +1492,52 @@
+ 
+   call update_time(nonbond_time)
+ !-------------------------------------
++!--------------fABAMBER---------------
++!-------------------------------------
++
++ if (mABP.gt.0.AND.nstep.ne.-1) then
++
++  ! download frc/crds
++  call gpu_download_cv_crd(xxff)
++  do i=1,np
++   do k=1,3
++      xx(i*3-(3-k))=xxff(k,i)
++    enddo
++  enddo
++
++  refCom(1,1) = xxff(1,9)
++  refCom(1,2) = xxff(2,9)
++  refCom(1,3) = xxff(3,9)
++
++  refCom(2,1) = xxff(1,10)
++  refCom(2,2) = xxff(2,10)
++  refCom(2,3) = xxff(3,10) !- 3d0
++
++  cylCom(1,1) = xxff(1,11)
++  cylCom(1,2) = xxff(2,11)
++  cylCom(1,3) = xxff(3,11) + 5d0
++
++  cylCom(2,1) = cylCom(1,1)
++  cylCom(2,2) = cylCom(1,2)
++  cylCom(2,3) = cylCom(1,3) - 60d0
++
++  !zero forces and call helof
++  biasf = 0d0
++  call hellof(nstep,xx,biasf,refCom,cylCom)
++  do i=1,np
++    do k=1,3
++      bias_frc(k,i) = biasf(i*3-(3-k))
++    enddo
++  enddo
++
++  ! reupload forces
++  call gpu_upload_cv_frc(bias_frc)
++
++ endif
++!-------------------------------------
++!-----------END fABAMBER--------------
++!-------------------------------------
++!-------------------------------------
+ !--------------NFE_MOD----------------
+ !-------------------------------------
+ if (infe.gt.0) then
+diff -urN -x '*.mod' ../../vanilla/amber16/src/pmemd/src/runmd.F90 src/pmemd/src/runmd.F90
+--- ../../vanilla/amber16/src/pmemd/src/runmd.F90	2019-09-04 11:59:31.680970000 -0400
++++ src/pmemd/src/runmd.F90	2019-09-09 18:20:00.794106000 -0400
+@@ -87,6 +87,9 @@
+ #else
+   use nfe_lib_mod, only : nfe_init
+ #endif
++
++! Modified by Parker de Waal---------------------------------------
++  use hello_mod
+ !---------------------------------------------------------------
+ 
+   implicit none
+@@ -226,6 +229,14 @@
+   double precision      :: VmaxDt,VminDt,VavgDt,sigmaVDt
+   double precision      :: VmaxPt,VminPt,VavgPt,sigmaVPt
+ 
++! based forces, added by Parker de Waal
++  integer                       :: mABP, np
++  double precision              :: xxff(3,16), xx(3*7), ff(3*7), biasf(3*7), bias_frc(3,7)
++  double precision              :: refCom(2,3), cylCom(2,3)
++  mABP = 1 ! 0/1 off/on
++  np = 7 ! Number of CV atoms
++
++
+ ! Runmd operates in kcal/mol units for energy, amu for masses,
+ ! and angstoms for distances.  To convert the input time parameters 
+ ! from picoseconds to internal units, multiply by 20.455 
+@@ -2970,7 +2981,45 @@
+ !--------------------------------------------------------------------
+ !--------------------------------------------------------------------
+ 
+-      if (nstep .ge. nstlim) exit
++      if (nstep .ge. nstlim) then
++!------------------------------------
++!--------------fABMACS---------------
++!------------------------------------
++
++ if (mABP.gt.0.AND.nstep.ne.-1) then
++
++  ! download frc/crds
++  call gpu_download_cv_crd(xxff)
++  do i=1,np
++   do k=1,3
++      xx(i*3-(3-k))=xxff(k,i)
++    enddo
++  enddo
++  refCom(1,1) = xxff(1,9)
++  refCom(1,2) = xxff(2,9)
++  refCom(1,3) = xxff(3,9)
++
++  refCom(2,1) = xxff(1,10)
++  refCom(2,2) = xxff(2,10)
++  refCom(2,3) = xxff(3,10) !- 3d0
++
++  cylCom(1,1) = xxff(1,11)
++  cylCom(1,2) = xxff(2,11)
++  cylCom(1,3) = xxff(3,11) + 5d0
++
++  cylCom(2,1) = cylCom(1,1)
++  cylCom(2,2) = cylCom(1,2)
++  cylCom(2,3) = cylCom(1,3) - 60d0
++
++  !zero forces and call helof
++  biasf = 0d0
++  call hellof(nstep,xx,biasf,refCom,cylCom)
++ endif
++!------------------------------------
++!-----------END fABMACS--------------
++!------------------------------------
++       exit
++      endif
+ 
+       ! Stop the run if timlim is set and reached. One more step will be taken
+       ! to ensure a final restart is written.
